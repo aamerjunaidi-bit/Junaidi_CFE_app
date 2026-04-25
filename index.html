@@ -591,13 +591,13 @@ function closeTopicDetail(){
  currentDetailTopic=null;
  raStop();
 }
-// ── READ ALOUD ENGINE v4 — Google TTS (natural) + Web Speech fallback ──
+// ── READ ALOUD ENGINE v5 — iOS-safe Google TTS ──
+// Strategy: collect all text segments → fetch as blobs BEFORE playing
+// (iOS requires play() on a gesture-created Audio that already has a blobURL)
 const RA_SKIP_RE=/^\s*(sample\s+prep|practice\s+question|example\s+question|question\s+\d|for\s+example[,:]?|e\.g\.|note:|tip:|exhibit\s+\d)/i;
-let raChunks=[],raIdx=0,raPlaying=false,raPaused=false,raRate=1.0,raAudio=null,raKeepalive=null;
-// Google TTS: splits text ≤200 chars at sentence boundaries, streams via <audio>
-function raSplitSentences(txt){
-return (txt.match(/[^.!?;,]+[.!?;,]*\s*/g)||[txt]).map(s=>s.trim()).filter(s=>s.length>1);
-}
+let raChunks=[],raIdx=0,raPlaying=false,raPaused=false,raRate=1.0;
+let raSegs=[],raSegIdx=0,raAudio=null,raBlobURLs=[],raFetching=false;
+
 function raBuildChunks(){
 const c=document.getElementById('td-content');if(!c)return[];
 const out=[];
@@ -608,20 +608,32 @@ out.push({el,txt});
 });
 return out;
 }
-// Build ≤200-char segments from a chunk for Google TTS URL limit
-function raSegments(txt){
-const segs=[],sents=raSplitSentences(txt);
+
+// Split one chunk into ≤190-char segments at clause boundaries
+function raSegment(txt){
+const segs=[];
+const parts=(txt.match(/[^.!?;,]+[.!?;,]*\s*/g)||[txt]).map(s=>s.trim()).filter(Boolean);
 let cur='';
-for(const s of sents){
-if((cur+s).length>190){if(cur)segs.push(cur.trim());cur=s;}
-else cur+=s+' ';
+for(const p of parts){
+if((cur+p).length>185){if(cur)segs.push(cur.trim());cur=p;}
+else cur+=(cur?' ':'')+p;
 }
 if(cur.trim())segs.push(cur.trim());
-return segs.length?segs:[txt.slice(0,190)];
+return segs.length?segs:[txt.slice(0,185)];
 }
-function raGoogleUrl(text){
-return 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q='+encodeURIComponent(text);
+
+function raGoogleUrl(t){
+return 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q='+encodeURIComponent(t);
 }
+
+// Fetch one segment → blob URL, with Web Speech text as fallback payload
+function raFetchSeg(text){
+return fetch(raGoogleUrl(text),{mode:'cors'})
+.then(r=>{if(!r.ok)throw new Error('bad');return r.blob();})
+.then(b=>({type:'blob',url:URL.createObjectURL(b),text}))
+.catch(()=>({type:'ws',text})); // fallback: use Web Speech
+}
+
 function raSetSpeed(r){
 raRate=r;
 [1,1.5,2].forEach(v=>{
@@ -629,42 +641,77 @@ const id='ra-s'+String(v).replace('.','');
 const b=document.getElementById(id);
 if(b)b.className='ra-speed'+(v===r?' active':'');
 });
+if(raAudio)raAudio.playbackRate=r;
 }
-// ── Main speak loop ──
-function raSpeak(idx){
-if(!raPlaying||idx>=raChunks.length){raStop();return;}
-const chunk=raChunks[idx];
-raHighlight(idx);raUpdProg(idx);
-const segs=raSegments(chunk.txt);
-let si=0;
-function nextSeg(){
-if(!raPlaying){return;}
-if(si>=segs.length){raIdx=idx+1;raSpeak(raIdx);return;}
-const seg=segs[si++];
-// Try Google TTS audio first
-const audio=new Audio();
-audio.crossOrigin='anonymous';
-audio.playbackRate=raRate;
-audio.src=raGoogleUrl(seg);
-raAudio=audio;
-audio.onended=()=>{if(raPlaying)nextSeg();};
-audio.onerror=()=>{
-// Google TTS blocked (CORS/network) — fall back to Web Speech for this seg
-raWSSeg(seg,()=>{if(raPlaying)nextSeg();});
-};
-audio.play().catch(()=>{
-raWSSeg(seg,()=>{if(raPlaying)nextSeg();});
+
+// Build flat segment list from all chunks, then pre-fetch blobs
+function raPrepare(cb){
+raSegs=[];
+raChunks.forEach(chunk=>{
+raSegment(chunk.txt).forEach(t=>raSegs.push({chunk,text:t}));
+});
+if(!raSegs.length){cb(false);return;}
+raFetching=true;
+// Pre-fetch first 3 segments immediately, rest lazily
+const prefetch=Math.min(3,raSegs.length);
+let done=0;
+raBlobURLs=new Array(raSegs.length).fill(null);
+function fetchOne(i){
+if(i>=raSegs.length){if(done>=prefetch)cb(true);return;}
+raFetchSeg(raSegs[i].text).then(result=>{
+raBlobURLs[i]=result;
+done++;
+if(done<=prefetch&&done===prefetch)cb(true);
+fetchOne(i+prefetch); // fetch rest in background
 });
 }
-nextSeg();
+for(let i=0;i<prefetch;i++)fetchOne(i);
 }
-// Web Speech fallback for one segment
+
+// Play one segment by index
+function raPlaySeg(si){
+if(!raPlaying||si>=raSegs.length){raStop();return;}
+// Update highlight when chunk changes
+const seg=raSegs[si];
+if(si===0||raSegs[si-1].chunk!==seg.chunk){
+const ci=raChunks.indexOf(seg.chunk);
+raIdx=ci;
+raHighlight(ci);
+raUpdProg(ci);
+}
+const payload=raBlobURLs[si];
+if(payload&&payload.type==='blob'){
+// Play blob audio — iOS-safe because Audio+src set synchronously
+const audio=new Audio(payload.url);
+audio.playbackRate=raRate;
+raAudio=audio;
+audio.onended=()=>{
+URL.revokeObjectURL(payload.url); // clean up
+raSegIdx=si+1;
+if(raPlaying)raPlaySeg(raSegIdx);
+};
+audio.onerror=()=>{
+// blob failed → try Web Speech for this seg
+raWSSeg(seg.text,()=>{raSegIdx=si+1;if(raPlaying)raPlaySeg(raSegIdx);});
+};
+audio.play().catch(()=>{
+raWSSeg(seg.text,()=>{raSegIdx=si+1;if(raPlaying)raPlaySeg(raSegIdx);});
+});
+}else if(payload&&payload.type==='ws'){
+// Google blocked — use Web Speech
+raWSSeg(seg.text,()=>{raSegIdx=si+1;if(raPlaying)raPlaySeg(raSegIdx);});
+}else{
+// Not fetched yet — wait 200ms and retry
+setTimeout(()=>{if(raPlaying)raPlaySeg(si);},200);
+}
+}
+
+// Web Speech for one segment (fallback)
 function raWSSeg(text,cb){
 if(!window.speechSynthesis){cb();return;}
 window.speechSynthesis.cancel();
 const utt=new SpeechSynthesisUtterance(text);
 utt.lang='en-US';utt.rate=raRate;utt.pitch=1;utt.volume=1;
-// Pick best available voice
 const voices=window.speechSynthesis.getVoices();
 const en=voices.filter(v=>v.lang&&v.lang.startsWith('en'));
 const best=en.find(v=>/enhanced|premium|natural|neural|online/i.test(v.name))||en[0];
@@ -672,31 +719,38 @@ if(best)utt.voice=best;
 utt.onend=cb;utt.onerror=cb;
 window.speechSynthesis.speak(utt);
 }
+
 function raToggle(){
 if(!raPlaying&&!raPaused){
+// Fresh start
 raChunks=raBuildChunks();
 if(!raChunks.length){showToast('No content to read');return;}
-raIdx=0;raPlaying=true;raPaused=false;
-raUpdateUI();raSpeak(0);
+raIdx=0;raSegIdx=0;raPlaying=true;raPaused=false;
+raUpdateUI();
+showToast('⏳ Loading audio…');
+raPrepare(ok=>{
+if(!raPlaying)return; // stopped while fetching
+raPlaySeg(0);
+});
 }else if(raPlaying&&!raPaused){
-// Pause
 raPlaying=false;raPaused=true;
-if(raAudio){raAudio.pause();}
-else{window.speechSynthesis.pause();}
+if(raAudio)raAudio.pause();
+else if(window.speechSynthesis)window.speechSynthesis.pause();
 raUpdateUI();
 }else if(raPaused){
-// Resume
 raPaused=false;raPlaying=true;
-if(raAudio&&raAudio.paused){raAudio.play().catch(()=>{raSpeak(raIdx);});}
-else{window.speechSynthesis.resume();}
+if(raAudio)raAudio.play().catch(()=>{raPlaySeg(raSegIdx);});
+else if(window.speechSynthesis)window.speechSynthesis.resume();
 raUpdateUI();
 }
 }
+
 function raHighlight(idx){
 document.querySelectorAll('.ra-reading').forEach(e=>e.classList.remove('ra-reading'));
 const c=raChunks[idx];
 if(c&&c.el){c.el.classList.add('ra-reading');c.el.scrollIntoView({behavior:'smooth',block:'nearest'});}
 }
+
 function raUpdProg(idx){
 const total=raChunks.length;
 const pct=total?Math.round(((idx+1)/total)*100):0;
@@ -705,14 +759,18 @@ const lbl=document.getElementById('ra-prog-lbl');
 if(fill)fill.style.width=pct+'%';
 if(lbl)lbl.textContent=(idx+1)+' / '+total;
 }
+
 function raStop(){
-clearInterval(raKeepalive);
+raFetching=false;raPlaying=false;raPaused=false;
 if(raAudio){raAudio.pause();raAudio.src='';raAudio=null;}
 if(window.speechSynthesis)window.speechSynthesis.cancel();
+// Revoke any leftover blob URLs
+raBlobURLs.forEach(p=>{if(p&&p.type==='blob'&&p.url)try{URL.revokeObjectURL(p.url);}catch(e){}});
+raBlobURLs=[];raSegs=[];raChunks=[];raIdx=0;raSegIdx=0;
 document.querySelectorAll('.ra-reading').forEach(e=>e.classList.remove('ra-reading'));
-raPlaying=false;raPaused=false;raIdx=0;raChunks=[];
 raUpdateUI();
 }
+
 function raUpdateUI(){
 const playBtn=document.getElementById('ra-play-btn');
 const stopBtn=document.getElementById('ra-stop-btn');
