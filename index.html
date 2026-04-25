@@ -591,38 +591,52 @@ function closeTopicDetail(){
  currentDetailTopic=null;
  raStop();
 }
-// ── READ ALOUD ENGINE v2 — natural voice ──
+// ── READ ALOUD ENGINE v3 — iOS natural voice ──
 const RA_SKIP_RE=/^\s*(sample\s+prep|practice\s+question|example\s+question|question\s+\d|for\s+example[,:]?|e\.g\.|note:|tip:|exhibit\s+\d)/i;
-let raChunks=[],raIdx=0,raPlaying=false,raPaused=false,raRate=1.0,raBestVoice=null,raKeepalive=null;
-// Voice priority list — picks the most natural available voice
+let raChunks=[],raIdx=0,raPlaying=false,raPaused=false,raRate=1.0,raBestVoice=null,raKeepalive=null,raWarmedUp=false;
+// Ordered preference — iPhone enhanced Siri voices first
 const RA_VOICE_PREF=[
-'com.apple.voice.enhanced.en-US.Ava','com.apple.voice.enhanced.en-US.Samantha',
-'com.apple.voice.enhanced.en-GB.Daniel','com.apple.voice.enhanced.en-AU.Karen',
+'com.apple.voice.enhanced.en-US.Ava',
+'com.apple.voice.enhanced.en-US.Samantha',
+'com.apple.voice.enhanced.en-AU.Karen',
+'com.apple.voice.enhanced.en-GB.Daniel',
+'com.apple.voice.enhanced.en-IE.Moira',
+'Ava','Samantha','Karen','Daniel','Moira','Tessa','Fiona',
 'Google UK English Female','Google UK English Male','Google US English',
 'Microsoft Aria Online (Natural) - English (United States)',
-'Microsoft Guy Online (Natural) - English (United States)',
-'Microsoft Jenny Online (Natural) - English (United States)',
-'Samantha','Daniel','Karen','Moira','Tessa','Fiona',
-'en-US-Standard-C','en-GB-Standard-A'
+'Microsoft Jenny Online (Natural) - English (United States)'
 ];
 function raPickVoice(){
 if(!window.speechSynthesis)return null;
 const voices=window.speechSynthesis.getVoices();
 if(!voices.length)return null;
+// Exact name match first
 for(const name of RA_VOICE_PREF){
 const v=voices.find(x=>x.name===name);
 if(v)return v;
 }
-// Fallback: prefer enhanced/natural/premium in name, english
+// Prefer any enhanced/premium English voice
 const en=voices.filter(v=>v.lang&&v.lang.startsWith('en'));
-const enhanced=en.find(v=>/enhanced|natural|premium|neural|online/i.test(v.name));
-if(enhanced)return enhanced;
-return en[0]||voices[0];
+const best=en.find(v=>/enhanced|premium|neural|natural|online/i.test(v.name));
+if(best)return best;
+// Prefer any local (not network) English voice — avoids robotic default
+const local=en.find(v=>!v.localService===false)||en[0];
+return local||voices[0];
 }
-function raInitVoice(cb){
-const voices=window.speechSynthesis.getVoices();
-if(voices.length){raBestVoice=raPickVoice();cb&&cb();}
-else{window.speechSynthesis.onvoiceschanged=()=>{raBestVoice=raPickVoice();cb&&cb();};}
+// iOS WORKAROUND: voices load lazily — fire a silent utterance first,
+// wait for it to end, re-pick voice (now populated), then start real reading.
+function raWarmUp(cb){
+if(raWarmedUp){raBestVoice=raPickVoice();cb();return;}
+const warm=new SpeechSynthesisUtterance(' ');
+warm.volume=0;warm.rate=2;warm.lang='en-US';
+warm.onend=()=>{
+raWarmedUp=true;
+// Give iOS 120ms to fully register voices after warm-up fires
+setTimeout(()=>{raBestVoice=raPickVoice();cb();},120);
+};
+warm.onerror=()=>{raWarmedUp=true;raBestVoice=raPickVoice();cb();};
+window.speechSynthesis.cancel();
+window.speechSynthesis.speak(warm);
 }
 // Split text into natural sentence chunks for smoother delivery
 function raSplitSentences(txt){
@@ -661,7 +675,7 @@ raChunks=raBuildChunks();
 if(!raChunks.length){showToast('No content to read');return;}
 raIdx=0;raPlaying=true;raPaused=false;
 raUpdateUI();
-raInitVoice(()=>raSpeak(0));
+raWarmUp(()=>raSpeak(0));
 } else if(raPlaying&&!raPaused){
 window.speechSynthesis.pause();
 clearInterval(raKeepalive);
@@ -678,10 +692,12 @@ raUpdateUI();
 }
 }
 function raMakeUtt(text){
+// Re-pick on every utt — iOS may have loaded more voices since warm-up
+const v=raPickVoice()||raBestVoice;
+raBestVoice=v;
 const utt=new SpeechSynthesisUtterance(text);
-if(raBestVoice)utt.voice=raBestVoice;
-utt.lang=raBestVoice?raBestVoice.lang:'en-US';
-// Natural rate: headings slower, bullets normal
+if(v)utt.voice=v;
+utt.lang=v?v.lang:'en-US';
 utt.rate=raRate;
 utt.pitch=1.0;
 utt.volume=1.0;
