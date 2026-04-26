@@ -614,22 +614,11 @@ if(b)b.className='ra-speed'+(v===r?' active':'');
 function raSpeak(idx){
 if(!raPlaying||idx>=raChunks.length){raStop();return;}
 raHighlight(idx);raUpdProg(idx);raIdx=idx;
-window.speechSynthesis.cancel();
 const utt=new SpeechSynthesisUtterance(raChunks[idx].txt);
 utt.lang='en-US';utt.rate=raRate;utt.pitch=1;utt.volume=1;
-let fired=false;
-utt.onend=function(){if(fired)return;fired=true;if(raPlaying)raSpeak(idx+1);};
-utt.onerror=function(e){if(fired)return;if(e.error==='interrupted')return;fired=true;if(raPlaying)raSpeak(idx+1);};
+utt.onend=function(){if(raIdx===idx&&raPlaying)raSpeak(idx+1);};
+utt.onerror=function(e){if(e.error==='interrupted'||e.error==='canceled')return;if(raIdx===idx&&raPlaying)raSpeak(idx+1);};
 window.speechSynthesis.speak(utt);
-// iOS keepalive: speechSynthesis pauses after ~15s without this
-if(/iPhone|iPad|iPod/i.test(navigator.userAgent)){
-  clearInterval(window._raKeepAlive);
-  window._raKeepAlive=setInterval(function(){
-    if(!raPlaying){clearInterval(window._raKeepAlive);return;}
-    window.speechSynthesis.pause();
-    window.speechSynthesis.resume();
-  },10000);
-}
 }
 function raToggle(){
 if(!raPlaying&&!raPaused){
@@ -655,10 +644,11 @@ if(fill)fill.style.width=pct+'%';
 if(lbl)lbl.textContent=(idx+1)+' / '+t;
 }
 function raStop(){
+raIdx=-1;
 window.speechSynthesis.cancel();
 clearInterval(window._raKeepAlive);
 document.querySelectorAll('.ra-reading').forEach(e=>e.classList.remove('ra-reading'));
-raPlaying=false;raPaused=false;raIdx=0;raChunks=[];raUpdateUI();
+raPlaying=false;raPaused=false;raChunks=[];raUpdateUI();
 }
 function raUpdateUI(){
 const p=document.getElementById('ra-play-btn'),s=document.getElementById('ra-stop-btn'),g=document.getElementById('ra-prog');
